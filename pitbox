@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""ams2-pitbox
+
+KISS entrypoint: run this file to install an Automobilista 2 mod archive.
+
+Example:
+  ./pitbox ~/Downloads/SomeMod.zip
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable, List, Optional
+
+
+@dataclass(frozen=True)
+class SteamLibrary:
+  root: Path
+
+  @property
+  def steamapps(self) -> Path:
+    return self.root / "steamapps"
+
+  @property
+  def common(self) -> Path:
+    return self.steamapps / "common"
+
+
+def log(msg: str) -> None:
+  print(f"[ams2-pitbox] {msg}")
+
+
+def die(msg: str, code: int = 1) -> None:
+  log(f"ERROR: {msg}")
+  raise SystemExit(code)
+
+
+def which(cmd: str) -> Optional[str]:
+  return shutil.which(cmd)
+
+
+def read_text_best_effort(path: Path) -> str:
+  try:
+    return path.read_text(encoding="utf-8", errors="replace")
+  except Exception:
+    return ""
+
+
+def steam_default_roots() -> List[Path]:
+  home = Path.home()
+  return [
+    home / ".local" / "share" / "Steam",
+    home / ".steam" / "steam",
+  ]
+
+
+def parse_libraryfolders_vdf(vdf_path: Path) -> List[Path]:
+  txt = read_text_best_effort(vdf_path)
+  paths: List[Path] = []
+  for m in re.finditer(r'"path"\s+"([^"]+)"', txt):
+    raw = m.group(1).replace("\\\\", "/")
+    paths.append(Path(raw).expanduser())
+  return paths
+
+
+def find_steam_libraries() -> List[SteamLibrary]:
+  libs: List[Path] = []
+  for root in steam_default_roots():
+    vdf = root / "steamapps" / "libraryfolders.vdf"
+    if vdf.is_file():
+      libs.extend(parse_libraryfolders_vdf(vdf))
+  libs.extend(steam_default_roots())
+
+  uniq: List[Path] = []
+  seen = set()
+  for p in libs:
+    try:
+      rp = p.expanduser().resolve()
+    except Exception:
+      rp = p.expanduser()
+    key = str(rp)
+    if key in seen:
+      continue
+    seen.add(key)
+    if (rp / "steamapps").is_dir():
+      uniq.append(rp)
+  return [SteamLibrary(root=p) for p in uniq]
+
+
+def detect_ams2_dirs(libs: Iterable[SteamLibrary]) -> List[Path]:
+  candidates: List[Path] = []
+  for lib in libs:
+    stable = lib.common / "Automobilista 2"
+    beta = lib.common / "Automobilista 2 Beta"
+    if stable.is_dir():
+      candidates.append(stable)
+    if beta.is_dir():
+      candidates.append(beta)
+  return candidates
+
+
+def guess_label_for_path(p: Path) -> str:
+  s = str(p)
+  if "/run/media/" in s or "/media/" in s or "/mnt/" in s:
+    return "SD / External"
+  if str(Path.home()) in s:
+    return "Internal (home)"
+  return "Steam library"
+
+
+def choose_from_list(prompt: str, options: List[Path]) -> Path:
+  if not options:
+    die("No options to choose from")
+  if len(options) == 1:
+    return options[0]
+
+  log(prompt)
+  for i, opt in enumerate(options, start=1):
+    log(f"  {i}) {guess_label_for_path(opt)}: {opt}")
+
+  while True:
+    sel = input("Select a number: ").strip()
+    if not sel.isdigit():
+      log("Please enter a number.")
+      continue
+    idx = int(sel)
+    if 1 <= idx <= len(options):
+      return options[idx - 1]
+    log("Out of range.")
+
+
+def extract_archive(archive: Path, dest_dir: Path) -> None:
+  suffix = archive.suffix.lower()
+
+  if suffix == ".zip":
+    import zipfile
+
+    with zipfile.ZipFile(archive, "r") as zf:
+      zf.extractall(dest_dir)
+    return
+
+  seven_zip = which("7z") or which("7zz")
+  if not seven_zip:
+    die(
+      f"Archive '{archive.name}' is not a .zip and requires 7zip (7z/7zz). "
+      "Install 7zip/p7zip, or repackage the mod as a .zip."
+    )
+
+  cmd = [seven_zip, "x", "-y", f"-o{str(dest_dir)}", str(archive)]
+  log(f"Extracting…")
+  proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+  if proc.returncode != 0:
+    log(proc.stdout)
+    die(f"7z failed to extract archive (exit {proc.returncode}).")
+
+
+def find_overlay_root(extracted_dir: Path) -> Path:
+  # 1) Most common: an "Automobilista 2" folder.
+  for root, dirs, _files in os.walk(extracted_dir):
+    if "Automobilista 2" in dirs:
+      return Path(root) / "Automobilista 2"
+
+  # 2) Fallback: direct overlay roots.
+  for root, dirs, _files in os.walk(extracted_dir):
+    dset = set(dirs)
+    if "UserData" in dset or "Vehicles" in dset:
+      return Path(root)
+
+  die(
+    "Could not find an AMS2 overlay in the extracted archive. "
+    "Expected an 'Automobilista 2/' folder (or at least 'UserData/' / 'Vehicles/')."
+  )
+
+
+def backups_base_dir() -> Path:
+  # KISS: always put backups in one predictable place.
+  return Path.home() / ".local" / "share" / "ams2-pitbox" / "backups"
+
+
+def rsync_install(overlay_root: Path, game_dir: Path, backups_dir: Path, dry_run: bool) -> None:
+  rsync = which("rsync")
+  if not rsync:
+    die("rsync not found.")
+
+  backups_dir.mkdir(parents=True, exist_ok=True)
+
+  args = [
+    rsync,
+    "-a",
+    "--human-readable",
+    "--backup",
+    f"--backup-dir={str(backups_dir)}",
+    str(overlay_root) + "/",
+    str(game_dir) + "/",
+  ]
+
+  if dry_run:
+    args.insert(2, "--dry-run")
+
+  log(f"Installing to: {game_dir}")
+  proc = subprocess.run(args)
+  if proc.returncode != 0:
+    die(f"rsync failed (exit {proc.returncode}).")
+
+
+def cp_install(overlay_root: Path, game_dir: Path, dry_run: bool) -> None:
+  log("NOTE: rsync not available; installing with a simple copy (no precise backups).")
+
+  def copy_tree(src: Path, dst: Path) -> None:
+    if not src.exists():
+      return
+    if dry_run:
+      log(f"(dry-run) Would copy: {src} -> {dst}")
+      return
+    dst.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dst, dirs_exist_ok=True)
+
+  copy_tree(overlay_root / "UserData", game_dir / "UserData")
+  copy_tree(overlay_root / "Vehicles", game_dir / "Vehicles")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+  ap = argparse.ArgumentParser(
+    description="AMS2 PitBox — install an Automobilista 2 mod archive on Linux/Steam Deck"
+  )
+  ap.add_argument("archive", type=Path, help="Path to mod archive (.zip, .7z, .rar, ...)")
+  ap.add_argument(
+    "--game-dir",
+    type=Path,
+    default=None,
+    help="Path to 'Automobilista 2' folder (only if auto-detection fails)",
+  )
+  ap.add_argument("--dry-run", action="store_true", help="Print actions without writing files")
+
+  args = ap.parse_args(argv)
+
+  archive = args.archive.expanduser()
+  if not archive.is_file():
+    die(f"Archive not found: {archive}")
+
+  if args.game_dir is not None:
+    game_dir = args.game_dir.expanduser()
+    if not game_dir.is_dir():
+      die(f"--game-dir does not exist: {game_dir}")
+  else:
+    libs = find_steam_libraries()
+    candidates = detect_ams2_dirs(libs)
+    if not candidates:
+      die(
+        "Could not auto-detect Automobilista 2 in your Steam libraries. "
+        "Use --game-dir '/path/to/steamapps/common/Automobilista 2'"
+      )
+    game_dir = choose_from_list("Where is Automobilista 2 installed?", candidates)
+
+  ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+  backups_dir = backups_base_dir() / ts / "rsync_overwritten_files"
+
+  with tempfile.TemporaryDirectory(prefix="ams2_pitbox_") as tmp:
+    tmpdir = Path(tmp)
+    extract_archive(archive, tmpdir)
+    overlay_root = find_overlay_root(tmpdir)
+    log(f"Mod root: {overlay_root}")
+
+    if which("rsync"):
+      rsync_install(overlay_root, game_dir, backups_dir, args.dry_run)
+      if not args.dry_run:
+        log(f"Backups: {backups_dir.parent}")
+    else:
+      cp_install(overlay_root, game_dir, args.dry_run)
+
+  log("Done.")
+  return 0
+
+
+if __name__ == "__main__":
+  raise SystemExit(main())
