@@ -1,29 +1,53 @@
 # 🧰 AMS2 PitBox
 
-Install **Automobilista 2** mods on **Steam Deck / Linux** from a mod archive.
+Install **Automobilista 2** mods (and skins/liveries) on **Steam Deck / Linux** from an archive. 🏎️💨
 
-## ⚠️ Important
+## 🧠 What it does (in human words)
 
-- **Use at your own risk.** No warranty, no guarantees.
-- Mods can **overwrite game files**.
-- Mod archives are not standardized; some mods may **fail to install**.
+1) 📦 Unpacks your archive (`.zip`, `.rar`, `.7z`, …)
+2) 🔎 Finds the AMS2 folders inside
+3) 📂 Copies files into your `Automobilista 2/` game folder
+4) 💾 If `rsync` exists, it also keeps backups of overwritten files
 
-## ✅ Quick start (3 steps)
+## ✅ What archives work?
 
-1) Put your mod archive in `~/Downloads` (example: `SomeMod.zip`)
+PitBox understands two common layouts:
 
-2) Open a terminal (Steam Deck Desktop Mode → **Konsole**)
+### 🧩 Full mod archives
+These contain one of:
+- `Automobilista 2/` (best)
+- `Vehicles/` or `UserData/`
 
-3) Run:
+### 🎨 Skin-only (livery) archives (even “flat” ones)
+These may contain **only**:
+- a `USER_OVERRIDES` `.xml`
+- plus `.dds` texture files/folders
+
+PitBox will wrap that into the right path under:
+`Vehicles/Textures/CustomLiveries/Overrides/<vehicle>/...`
+
+## 🚀 Quick start (noob mode)
+
+1) 📥 Put your archive in `~/Downloads` (example: `SomeMod.zip`)
+2) 🖥️ Open a terminal (Steam Deck Desktop Mode → **Konsole**)
+3) ▶️ Run:
 
 - `chmod +x ./ams2-pitbox/pitbox`
 - `./ams2-pitbox/pitbox ~/Downloads/SomeMod.zip`
 
-If you have more than one Steam library (internal + SD), PitBox will ask which one to use.
+If you have multiple Steam libraries (internal + SD), PitBox will ask which one to use. 🗂️
 
-## 🔎 Dry-run (recommended)
+## 🧪 Dry-run (recommended)
+
+See what would happen without copying files:
 
 - `./ams2-pitbox/pitbox --dry-run ~/Downloads/SomeMod.zip`
+
+## 🧰 Requirements
+
+- 🐍 Python 3
+- 🗜️ For `.rar` / `.7z`: `7z` or `7zz` (7zip / p7zip)
+- 💾 Optional: `rsync` (better install + backups)
 
 ## 💾 Backups
 
@@ -33,6 +57,12 @@ If `rsync` is available, overwritten files are backed up to:
 
 ## 🧯 Troubleshooting
 
-- “Permission denied”: run `chmod +x ./ams2-pitbox/pitbox`
-- “7z/7zz not found”: install 7zip/p7zip (needed for `.7z`/`.rar`)
-- “Could not auto-detect Automobilista 2”: run with `--game-dir` and point to your game folder
+- 😵 “Permission denied” → run `chmod +x ./ams2-pitbox/pitbox`
+- 🗜️ “7z/7zz not found” → install 7zip/p7zip (needed for `.rar`/`.7z`)
+- 🔎 “Could not auto-detect Automobilista 2” → point it manually:
+	- `./ams2-pitbox/pitbox --game-dir "/path/to/steamapps/common/Automobilista 2" ~/Downloads/SomeMod.zip`
+
+## ⚠️ Small print
+
+- Use at your own risk. Mods can overwrite game files.
+- Archives are not standardized; some mods may fail to install.

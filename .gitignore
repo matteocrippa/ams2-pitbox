@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Archives / mod downloads (keep the repo lean)
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+
+# macOS
+.DS_Store

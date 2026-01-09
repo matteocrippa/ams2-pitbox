@@ -175,10 +175,116 @@ def find_overlay_root(extracted_dir: Path) -> Path:
     if "UserData" in dset or "Vehicles" in dset:
       return Path(root)
 
+  # 3) Fallback: "flat" skin packs.
+  # Some archives contain only a single Overrides/<vehicle>/ folder with XML + DDS,
+  # without the full Automobilista 2/Vehicles/... hierarchy. Detect and wrap.
+  skin = find_skin_pack_root(extracted_dir)
+  if skin is not None:
+    log("Detected a skin-only archive; building an overlay structure…")
+    return build_overlay_from_skin_pack(extracted_dir, skin)
+
   die(
     "Could not find an AMS2 overlay in the extracted archive. "
     "Expected an 'Automobilista 2/' folder (or at least 'UserData/' / 'Vehicles/')."
   )
+
+
+def looks_like_user_overrides_xml(path: Path) -> bool:
+  try:
+    # Keep it cheap: only scan the beginning.
+    head = path.read_text(encoding="utf-8", errors="replace")[:4096].lower()
+  except Exception:
+    return False
+  return "<user_overrides" in head
+
+
+def find_skin_pack_root(extracted_dir: Path) -> Optional[Path]:
+  """Find a directory that looks like an AMS2 livery override folder.
+
+  Heuristic: a folder containing at least one override XML (USER_OVERRIDES)
+  and at least one .dds somewhere below it.
+  """
+  candidates: List[Path] = []
+
+  for root, _dirs, files in os.walk(extracted_dir):
+    r = Path(root)
+    xmls = [r / f for f in files if f.lower().endswith(".xml")]
+    if not xmls:
+      continue
+    if not any(looks_like_user_overrides_xml(x) for x in xmls):
+      continue
+
+    # Check for at least one .dds in this folder or subfolders.
+    has_dds = False
+    for _r2, _d2, f2 in os.walk(r):
+      if any(fn.lower().endswith(".dds") for fn in f2):
+        has_dds = True
+        break
+    if not has_dds:
+      continue
+
+    candidates.append(r)
+
+  if not candidates:
+    return None
+
+  # Prefer candidates that are already under an 'Overrides' folder.
+  def score(p: Path) -> int:
+    parts = [x.lower() for x in p.parts]
+    return 10 if "overrides" in parts else 0
+
+  candidates.sort(key=score, reverse=True)
+
+  # If there are multiple plausible roots, ask the user.
+  if len(candidates) > 1:
+    chosen = choose_from_list(
+      "Multiple skin folders found in archive. Which one should be installed?",
+      candidates,
+    )
+    return chosen
+
+  return candidates[0]
+
+
+def infer_vehicle_override_folder_name(skin_root: Path) -> str:
+  # Common case: .../Overrides/<vehicle_name>
+  parts = list(skin_root.parts)
+  lowered = [p.lower() for p in parts]
+  if "overrides" in lowered:
+    i = lowered.index("overrides")
+    if i + 1 < len(parts):
+      return parts[i + 1]
+  return skin_root.name
+
+
+def build_overlay_from_skin_pack(extracted_dir: Path, skin_root: Path) -> Path:
+  """Wrap a flat skin folder into a valid overlay root.
+
+  Creates:
+    <extracted_dir>/_ams2_pitbox_overlay/\
+      Vehicles/Textures/CustomLiveries/Overrides/<vehicle>/...
+
+  Then copies skin_root contents into that target.
+  """
+  overlay_base = extracted_dir / "_ams2_pitbox_overlay"
+  vehicle = infer_vehicle_override_folder_name(skin_root)
+  target = (
+    overlay_base
+    / "Vehicles"
+    / "Textures"
+    / "CustomLiveries"
+    / "Overrides"
+    / vehicle
+  )
+
+  if overlay_base.exists():
+    # Shouldn't happen in our temp dir, but keep it deterministic.
+    shutil.rmtree(overlay_base)
+
+  target.parent.mkdir(parents=True, exist_ok=True)
+  shutil.copytree(skin_root, target, dirs_exist_ok=True)
+  log(f"Skin overlay target: {target}")
+  return overlay_base
 
 
 def backups_base_dir() -> Path:
