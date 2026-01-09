@@ -17,7 +17,6 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -287,39 +286,8 @@ def build_overlay_from_skin_pack(extracted_dir: Path, skin_root: Path) -> Path:
   return overlay_base
 
 
-def backups_base_dir() -> Path:
-  # KISS: always put backups in one predictable place.
-  return Path.home() / ".local" / "share" / "ams2-pitbox" / "backups"
-
-
-def rsync_install(overlay_root: Path, game_dir: Path, backups_dir: Path, dry_run: bool) -> None:
-  rsync = which("rsync")
-  if not rsync:
-    die("rsync not found.")
-
-  backups_dir.mkdir(parents=True, exist_ok=True)
-
-  args = [
-    rsync,
-    "-a",
-    "--human-readable",
-    "--backup",
-    f"--backup-dir={str(backups_dir)}",
-    str(overlay_root) + "/",
-    str(game_dir) + "/",
-  ]
-
-  if dry_run:
-    args.insert(2, "--dry-run")
-
-  log(f"Installing to: {game_dir}")
-  proc = subprocess.run(args)
-  if proc.returncode != 0:
-    die(f"rsync failed (exit {proc.returncode}).")
-
-
-def cp_install(overlay_root: Path, game_dir: Path, dry_run: bool) -> None:
-  log("NOTE: rsync not available; installing with a simple copy (no precise backups).")
+def install_overlay(overlay_root: Path, game_dir: Path, dry_run: bool) -> None:
+  """Install overlay into the game dir using only the Python stdlib."""
 
   def copy_tree(src: Path, dst: Path) -> None:
     if not src.exists():
@@ -367,21 +335,14 @@ def main(argv: Optional[List[str]] = None) -> int:
       )
     game_dir = choose_from_list("Where is Automobilista 2 installed?", candidates)
 
-  ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-  backups_dir = backups_base_dir() / ts / "rsync_overwritten_files"
-
   with tempfile.TemporaryDirectory(prefix="ams2_pitbox_") as tmp:
     tmpdir = Path(tmp)
     extract_archive(archive, tmpdir)
     overlay_root = find_overlay_root(tmpdir)
     log(f"Mod root: {overlay_root}")
 
-    if which("rsync"):
-      rsync_install(overlay_root, game_dir, backups_dir, args.dry_run)
-      if not args.dry_run:
-        log(f"Backups: {backups_dir.parent}")
-    else:
-      cp_install(overlay_root, game_dir, args.dry_run)
+    log(f"Installing to: {game_dir}")
+    install_overlay(overlay_root, game_dir, args.dry_run)
 
   log("Done.")
   return 0

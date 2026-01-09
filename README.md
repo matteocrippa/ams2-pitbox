@@ -7,7 +7,7 @@ Install **Automobilista 2** mods (and skins/liveries) on **Steam Deck / Linux** 
 1) 📦 Unpacks your archive (`.zip`, `.rar`, `.7z`, …)
 2) 🔎 Finds the AMS2 folders inside
 3) 📂 Copies files into your `Automobilista 2/` game folder
-4) 💾 If `rsync` exists, it also keeps backups of overwritten files
+4) ✅ Done. (No extra tools, no fancy stuff.)
 
 ## ✅ What archives work?
 
@@ -47,13 +47,11 @@ See what would happen without copying files:
 
 - 🐍 Python 3
 - 🗜️ For `.rar` / `.7z`: `7z` or `7zz` (7zip / p7zip)
-- 💾 Optional: `rsync` (better install + backups)
 
-## 💾 Backups
+## 🧯 Undo / Recovery
 
-If `rsync` is available, overwritten files are backed up to:
-
-- `~/.local/share/ams2-pitbox/backups/<timestamp>/`
+- 🧼 Easiest: use **Steam → Verify integrity of game files**
+- 🔁 Or just remove the modded files and verify again
 
 ## 🧯 Troubleshooting
 
