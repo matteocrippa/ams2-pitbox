@@ -2,6 +2,23 @@
 __pycache__/
 *.py[cod]
 
+# Optional local files
+requirements.txt
+
+# Virtual environments
+.venv/
+
+# Local test artifacts
+_dummy_game/
+_tmp_nested_extract/
+_inspect_thunderflash.json
+_smoke_*.json
+_smoke_*.log
+_smoke_*.exit
+
+# Local VS Code tasks (generated during development)
+.vscode/
+
 # Archives / mod downloads (keep the repo lean)
 *.zip
 *.rar

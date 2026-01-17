@@ -150,16 +150,85 @@ def extract_archive(archive: Path, dest_dir: Path) -> None:
   seven_zip = which("7z") or which("7zz")
   if not seven_zip:
     die(
-      f"Archive '{archive.name}' is not a .zip and requires 7zip (7z/7zz). "
-      "Install 7zip/p7zip, or repackage the mod as a .zip."
+      f"Archive '{archive.name}' requires 7zip (7z/7zz). "
+      "Install it (Steam Deck / Debian/Ubuntu: 'sudo apt install p7zip-full'), "
+      "or extract the archive manually and pass the extracted folder."
     )
 
   cmd = [seven_zip, "x", "-y", f"-o{str(dest_dir)}", str(archive)]
-  log(f"Extracting…")
+  log("Extracting…")
   proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
   if proc.returncode != 0:
     log(proc.stdout)
     die(f"7z failed to extract archive (exit {proc.returncode}).")
+
+
+def is_archive_file(path: Path) -> bool:
+  if not path.is_file():
+    return False
+  return path.suffix.lower() in {".zip", ".7z", ".rar"}
+
+
+def find_archives(extracted_dir: Path) -> List[Path]:
+  archives: List[Path] = []
+  for root, _dirs, files in os.walk(extracted_dir):
+    r = Path(root)
+    for f in files:
+      p = r / f
+      if is_archive_file(p):
+        archives.append(p)
+  # Deterministic order.
+  archives.sort(key=lambda p: str(p).lower())
+  return archives
+
+
+def try_find_overlay_root(extracted_dir: Path) -> Optional[Path]:
+  try:
+    return find_overlay_root(extracted_dir)
+  except SystemExit:
+    return None
+
+
+def collect_overlay_roots(source_dir: Path, *, max_depth: int = 2, _depth: int = 0) -> List[Path]:
+  """Return one or more overlay roots contained in a directory.
+
+  Supports "container" archives that unpack into multiple mod archives.
+  """
+  direct = try_find_overlay_root(source_dir)
+  if direct is not None:
+    return [direct]
+
+  if _depth >= max_depth:
+    return []
+
+  archives = find_archives(source_dir)
+  if not archives:
+    return []
+
+  overlays: List[Path] = []
+  container = source_dir / "_ams2_pitbox_container"
+  container.mkdir(parents=True, exist_ok=True)
+
+  for i, arc in enumerate(archives, start=1):
+    child_dir = container / f"child_{i:03d}"
+    if child_dir.exists():
+      shutil.rmtree(child_dir)
+    child_dir.mkdir(parents=True, exist_ok=True)
+
+    log(f"Extracting nested archive: {arc.name}")
+    extract_archive(arc, child_dir)
+    overlays.extend(collect_overlay_roots(child_dir, max_depth=max_depth, _depth=_depth + 1))
+
+  # If a container has many nested archives, there may be duplicates (rare).
+  uniq: List[Path] = []
+  seen = set()
+  for p in overlays:
+    key = str(p.resolve()) if p.exists() else str(p)
+    if key in seen:
+      continue
+    seen.add(key)
+    uniq.append(p)
+  return uniq
 
 
 def find_overlay_root(extracted_dir: Path) -> Path:
@@ -306,7 +375,13 @@ def main(argv: Optional[List[str]] = None) -> int:
   ap = argparse.ArgumentParser(
     description="AMS2 PitBox — install an Automobilista 2 mod archive on Linux/Steam Deck"
   )
-  ap.add_argument("archive", type=Path, help="Path to mod archive (.zip, .7z, .rar, ...)")
+  ap.add_argument(
+    "source",
+    type=Path,
+    help=(
+      "Path to mod archive (.zip, .7z, .rar, ...) OR a folder you already extracted manually"
+    ),
+  )
   ap.add_argument(
     "--game-dir",
     type=Path,
@@ -317,9 +392,9 @@ def main(argv: Optional[List[str]] = None) -> int:
 
   args = ap.parse_args(argv)
 
-  archive = args.archive.expanduser()
-  if not archive.is_file():
-    die(f"Archive not found: {archive}")
+  source = args.source.expanduser()
+  if not source.exists():
+    die(f"Source not found: {source}")
 
   if args.game_dir is not None:
     game_dir = args.game_dir.expanduser()
@@ -335,14 +410,37 @@ def main(argv: Optional[List[str]] = None) -> int:
       )
     game_dir = choose_from_list("Where is Automobilista 2 installed?", candidates)
 
-  with tempfile.TemporaryDirectory(prefix="ams2_pitbox_") as tmp:
-    tmpdir = Path(tmp)
-    extract_archive(archive, tmpdir)
-    overlay_root = find_overlay_root(tmpdir)
-    log(f"Mod root: {overlay_root}")
+  if source.is_dir():
+    # User already extracted the archive manually.
+    overlay_roots = collect_overlay_roots(source)
+    if not overlay_roots:
+      die(
+        "Could not find an AMS2 overlay (or nested mod archives) in the provided folder. "
+        "Expected an 'Automobilista 2/' folder (or at least 'UserData/' / 'Vehicles/'), "
+        "or a folder containing mod archives (.zip/.7z/.rar)."
+      )
 
     log(f"Installing to: {game_dir}")
-    install_overlay(overlay_root, game_dir, args.dry_run)
+    for overlay_root in overlay_roots:
+      log(f"Mod root: {overlay_root}")
+      install_overlay(overlay_root, game_dir, args.dry_run)
+  else:
+    tmp_base = Path("/tmp") if Path("/tmp").is_dir() else None
+    with tempfile.TemporaryDirectory(prefix="ams2_pitbox_", dir=str(tmp_base) if tmp_base else None) as tmp:
+      tmpdir = Path(tmp)
+      extract_archive(source, tmpdir)
+      overlay_roots = collect_overlay_roots(tmpdir)
+      if not overlay_roots:
+        die(
+          "Could not find an AMS2 overlay after extracting the archive. "
+          "Expected an 'Automobilista 2/' folder (or at least 'UserData/' / 'Vehicles/'), "
+          "or nested mod archives (.zip/.7z/.rar)."
+        )
+
+      log(f"Installing to: {game_dir}")
+      for overlay_root in overlay_roots:
+        log(f"Mod root: {overlay_root}")
+        install_overlay(overlay_root, game_dir, args.dry_run)
 
   log("Done.")
   return 0
