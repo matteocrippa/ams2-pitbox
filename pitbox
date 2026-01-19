@@ -198,9 +198,19 @@ def list_archive_members(archive: Path) -> List[str]:
   members: List[str] = []
   cur_path: Optional[str] = None
   cur_is_folder: Optional[bool] = None
+  in_listing = False
 
   for raw in proc.stdout.splitlines():
     line = raw.strip("\r\n")
+    # 7z -slt prints an initial properties block for the archive itself.
+    # The actual file listing begins after a dashed separator.
+    if line.startswith("----------"):
+      in_listing = True
+      cur_path = None
+      cur_is_folder = None
+      continue
+    if not in_listing:
+      continue
     if line.startswith("Path = "):
       cur_path = line[len("Path = ") :]
       cur_is_folder = None
@@ -282,6 +292,17 @@ def extract_member_to_file(archive: Path, member: str, out_file: Path) -> None:
     if err:
       log(err)
     die(f"7z failed to extract member '{member}' (exit {proc.returncode}).")
+
+
+def is_writable_dir(p: Path) -> bool:
+  try:
+    p.mkdir(parents=True, exist_ok=True)
+    probe = p / f".ams2_pitbox_write_test_{os.getpid()}"
+    probe.write_text("ok", encoding="utf-8")
+    probe.unlink(missing_ok=True)
+    return True
+  except Exception:
+    return False
 
 
 def is_archive_file(path: Path) -> bool:
@@ -722,7 +743,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     default=None,
     help=(
       "Where to extract temporary files. Useful for large container packs. "
-      "Default: /tmp (if available) or system temp."
+      "Default: next to the source archive/folder (if writable), else /tmp/system temp."
     ),
   )
   ap.add_argument(
@@ -751,7 +772,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not work_dir.is_dir():
       die(f"--work-dir is not a directory: {work_dir}")
   else:
-    work_dir = Path("/tmp") if Path("/tmp").is_dir() else Path(tempfile.gettempdir())
+    # KISS default: extract next to the archive/folder when possible.
+    # This avoids small /tmp partitions and keeps everything on the same disk.
+    preferred = source if source.is_dir() else source.parent
+    if is_writable_dir(preferred):
+      work_dir = preferred
+    else:
+      work_dir = Path("/tmp") if Path("/tmp").is_dir() else Path(tempfile.gettempdir())
 
   if args.game_dir is not None:
     game_dir = args.game_dir.expanduser()

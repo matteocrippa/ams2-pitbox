@@ -48,6 +48,9 @@ choose where temporary files are written:
 
 - `--work-dir /path/to/a/bigger/disk`
 
+By default, PitBox will try to write temporary files **next to the source archive/folder** (same disk),
+and only fall back to `/tmp` / system temp if that location isn’t writable.
+
 Examples:
 
 - Steam Deck SD card (example path): `--work-dir /run/media/mmcblk0p1`
