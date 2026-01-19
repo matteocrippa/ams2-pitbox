@@ -10,6 +10,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import errno
 import os
 import re
 import shutil
@@ -163,6 +164,126 @@ def extract_archive(archive: Path, dest_dir: Path) -> None:
     die(f"7z failed to extract archive (exit {proc.returncode}).")
 
 
+def _seven_zip_path() -> Optional[str]:
+  return which("7z") or which("7zz")
+
+
+def list_archive_members(archive: Path) -> List[str]:
+  """List file members inside an archive without extracting it.
+
+  For .zip uses the stdlib. For .7z/.rar uses 7z/7zz.
+  Returns member paths as stored in the archive.
+  """
+  suffix = archive.suffix.lower()
+  if suffix == ".zip":
+    import zipfile
+
+    with zipfile.ZipFile(archive, "r") as zf:
+      return list(zf.namelist())
+
+  seven_zip = _seven_zip_path()
+  if not seven_zip:
+    die(
+      f"Archive '{archive.name}' requires 7zip (7z/7zz). "
+      "Install it, or extract the archive manually and pass the extracted folder."
+    )
+
+  # -slt gives a stable, parseable format.
+  cmd = [seven_zip, "l", "-slt", str(archive)]
+  proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+  if proc.returncode != 0:
+    log(proc.stdout)
+    die(f"7z failed to list archive members (exit {proc.returncode}).")
+
+  members: List[str] = []
+  cur_path: Optional[str] = None
+  cur_is_folder: Optional[bool] = None
+
+  for raw in proc.stdout.splitlines():
+    line = raw.strip("\r\n")
+    if line.startswith("Path = "):
+      cur_path = line[len("Path = ") :]
+      cur_is_folder = None
+      continue
+    if line.startswith("Folder = "):
+      v = line[len("Folder = ") :].strip().lower()
+      cur_is_folder = v in {"+", "yes", "true"}
+      continue
+    # Record at block boundaries.
+    if line == "" and cur_path is not None:
+      if not cur_is_folder:
+        members.append(cur_path)
+      cur_path = None
+      cur_is_folder = None
+
+  # Flush last block (7z output doesn't always end with blank line).
+  if cur_path is not None and not cur_is_folder:
+    members.append(cur_path)
+
+  return members
+
+
+def archive_contains_overlay(members: Iterable[str]) -> bool:
+  """Cheap check: does the archive appear to contain an AMS2 overlay directly?"""
+  for m in members:
+    mp = m.replace("\\", "/").lstrip("/")
+    if mp == "Automobilista 2" or mp.startswith("Automobilista 2/"):
+      return True
+    if mp == "Vehicles" or mp.startswith("Vehicles/"):
+      return True
+    if mp == "UserData" or mp.startswith("UserData/"):
+      return True
+  return False
+
+
+def archive_nested_members(members: Iterable[str]) -> List[str]:
+  nested: List[str] = []
+  for m in members:
+    mp = m.replace("\\", "/")
+    # Skip obvious directories.
+    if mp.endswith("/"):
+      continue
+    lower = mp.lower()
+    if lower.endswith((".zip", ".7z", ".rar")):
+      nested.append(m)
+  nested.sort(key=lambda s: s.lower())
+  return nested
+
+
+def extract_member_to_file(archive: Path, member: str, out_file: Path) -> None:
+  """Extract a single member from an archive to a file on disk.
+
+  This enables processing 'container packs' (archive of many archives) without
+  fully extracting the outer archive.
+  """
+  out_file.parent.mkdir(parents=True, exist_ok=True)
+  suffix = archive.suffix.lower()
+  if suffix == ".zip":
+    import zipfile
+
+    with zipfile.ZipFile(archive, "r") as zf:
+      with zf.open(member, "r") as src, out_file.open("wb") as dst:
+        shutil.copyfileobj(src, dst, length=1024 * 1024)
+    return
+
+  seven_zip = _seven_zip_path()
+  if not seven_zip:
+    die(
+      f"Archive '{archive.name}' requires 7zip (7z/7zz). "
+      "Install it, or extract the archive manually and pass the extracted folder."
+    )
+
+  # -so streams file contents to stdout; keep stdout clean and avoid progress noise.
+  cmd = [seven_zip, "x", "-y", "-bd", "-so", str(archive), member]
+  with out_file.open("wb") as fh:
+    proc = subprocess.run(cmd, stdout=fh, stderr=subprocess.PIPE)
+  if proc.returncode != 0:
+    err = proc.stderr.decode("utf-8", errors="replace") if proc.stderr else ""
+    if err:
+      log(err)
+    die(f"7z failed to extract member '{member}' (exit {proc.returncode}).")
+
+
 def is_archive_file(path: Path) -> bool:
   if not path.is_file():
     return False
@@ -180,6 +301,212 @@ def find_archives(extracted_dir: Path) -> List[Path]:
   # Deterministic order.
   archives.sort(key=lambda p: str(p).lower())
   return archives
+
+
+def install_from_extracted_dir(
+  source_dir: Path,
+  *,
+  game_dir: Path,
+  dry_run: bool,
+  work_dir: Path,
+  keep_work: bool,
+  max_depth: int,
+  _depth: int = 0,
+) -> int:
+  """Install a mod from an extracted folder.
+
+  Handles direct overlays and folders that contain nested archives.
+  """
+  direct = try_find_overlay_root(source_dir)
+  if direct is not None:
+    log(f"Mod root: {direct}")
+    install_overlay(direct, game_dir, dry_run)
+    return 1
+
+  if _depth >= max_depth:
+    return 0
+
+  archives = find_archives(source_dir)
+  if not archives:
+    return 0
+
+  installed = 0
+  for arc in archives:
+    installed += install_from_archive(
+      arc,
+      game_dir=game_dir,
+      dry_run=dry_run,
+      work_dir=work_dir,
+      keep_work=keep_work,
+      max_depth=max_depth,
+      _depth=_depth + 1,
+    )
+
+  return installed
+
+
+def install_from_archive(
+  archive: Path,
+  *,
+  game_dir: Path,
+  dry_run: bool,
+  work_dir: Path,
+  keep_work: bool,
+  max_depth: int,
+  _depth: int = 0,
+) -> int:
+  """Install a mod from an archive.
+
+  Smart behavior:
+  - If archive contains a direct overlay, extract to a temp folder and install.
+  - If archive looks like a container pack (many nested archives), extract each
+    nested archive member one-by-one to disk, install it, then clean up.
+  """
+  if _depth > max_depth:
+    return 0
+
+  try:
+    members = list_archive_members(archive)
+  except OSError as e:
+    # Listing itself rarely hits ENOSPC, but keep messaging consistent.
+    if getattr(e, "errno", None) == errno.ENOSPC:
+      die(
+        "No space left on device while reading archive metadata. "
+        "Try using --work-dir on a larger disk (e.g. SD card) or free space."
+      )
+    raise
+
+  # Direct overlay: use existing extraction + robust overlay detection.
+  if archive_contains_overlay(members):
+    if keep_work:
+      tmpdir = Path(tempfile.mkdtemp(prefix="ams2_pitbox_", dir=str(work_dir)))
+      log(f"Keeping work folder for debugging: {tmpdir}")
+      try:
+        extract_archive(archive, tmpdir)
+        installed = install_from_extracted_dir(
+          tmpdir,
+          game_dir=game_dir,
+          dry_run=dry_run,
+          work_dir=work_dir,
+          keep_work=keep_work,
+          max_depth=max_depth,
+          _depth=_depth,
+        )
+      except OSError as e:
+        if getattr(e, "errno", None) == errno.ENOSPC:
+          die(
+            "No space left on device while extracting the archive. "
+            f"Try --work-dir on a larger disk. Current work dir: {work_dir}"
+          )
+        raise
+      return installed
+
+    with tempfile.TemporaryDirectory(prefix="ams2_pitbox_", dir=str(work_dir)) as tmp:
+      tmpdir = Path(tmp)
+      try:
+        extract_archive(archive, tmpdir)
+      except OSError as e:
+        if getattr(e, "errno", None) == errno.ENOSPC:
+          die(
+            "No space left on device while extracting the archive. "
+            f"Try --work-dir on a larger disk. Current work dir: {work_dir}"
+          )
+        raise
+
+      return install_from_extracted_dir(
+        tmpdir,
+        game_dir=game_dir,
+        dry_run=dry_run,
+        work_dir=work_dir,
+        keep_work=keep_work,
+        max_depth=max_depth,
+        _depth=_depth,
+      )
+
+  nested = archive_nested_members(members)
+  if nested and _depth < max_depth:
+    log(f"Detected container pack: {archive.name} ({len(nested)} nested archives)")
+
+    # Process one nested archive at a time to keep disk usage bounded.
+    installed = 0
+    for i, member in enumerate(nested, start=1):
+      base = Path(member.replace("\\", "/")).name
+      log(f"[{i}/{len(nested)}] Processing nested archive: {base}")
+
+      tmp_parent = Path(
+        tempfile.mkdtemp(prefix="ams2_pitbox_child_", dir=str(work_dir))
+      )
+      try:
+        child_archive = tmp_parent / base
+        try:
+          extract_member_to_file(archive, member, child_archive)
+        except OSError as e:
+          if getattr(e, "errno", None) == errno.ENOSPC:
+            die(
+              "No space left on device while extracting a nested archive from the container. "
+              f"Try --work-dir on a larger disk. Current work dir: {work_dir}"
+            )
+          raise
+
+        installed += install_from_archive(
+          child_archive,
+          game_dir=game_dir,
+          dry_run=dry_run,
+          work_dir=work_dir,
+          keep_work=keep_work,
+          max_depth=max_depth,
+          _depth=_depth + 1,
+        )
+      finally:
+        if keep_work:
+          log(f"Keeping work folder for debugging: {tmp_parent}")
+        else:
+          shutil.rmtree(tmp_parent, ignore_errors=True)
+    return installed
+
+  # Fallback: unknown layout. Extract fully and try existing heuristics.
+  if keep_work:
+    tmpdir = Path(tempfile.mkdtemp(prefix="ams2_pitbox_", dir=str(work_dir)))
+    log(f"Keeping work folder for debugging: {tmpdir}")
+    try:
+      extract_archive(archive, tmpdir)
+    except OSError as e:
+      if getattr(e, "errno", None) == errno.ENOSPC:
+        die(
+          "No space left on device while extracting the archive. "
+          f"Try --work-dir on a larger disk. Current work dir: {work_dir}"
+        )
+      raise
+    return install_from_extracted_dir(
+      tmpdir,
+      game_dir=game_dir,
+      dry_run=dry_run,
+      work_dir=work_dir,
+      keep_work=keep_work,
+      max_depth=max_depth,
+      _depth=_depth,
+    )
+
+  with tempfile.TemporaryDirectory(prefix="ams2_pitbox_", dir=str(work_dir)) as tmp:
+    tmpdir = Path(tmp)
+    try:
+      extract_archive(archive, tmpdir)
+    except OSError as e:
+      if getattr(e, "errno", None) == errno.ENOSPC:
+        die(
+          "No space left on device while extracting the archive. "
+          f"Try --work-dir on a larger disk. Current work dir: {work_dir}"
+        )
+      raise
+    return install_from_extracted_dir(
+      tmpdir,
+      game_dir=game_dir,
+      dry_run=dry_run,
+      work_dir=work_dir,
+      keep_work=keep_work,
+      max_depth=max_depth,
+      _depth=_depth,
+    )
 
 
 def try_find_overlay_root(extracted_dir: Path) -> Optional[Path]:
@@ -389,12 +716,42 @@ def main(argv: Optional[List[str]] = None) -> int:
     help="Path to 'Automobilista 2' folder (only if auto-detection fails)",
   )
   ap.add_argument("--dry-run", action="store_true", help="Print actions without writing files")
+  ap.add_argument(
+    "--work-dir",
+    type=Path,
+    default=None,
+    help=(
+      "Where to extract temporary files. Useful for large container packs. "
+      "Default: /tmp (if available) or system temp."
+    ),
+  )
+  ap.add_argument(
+    "--keep-work",
+    action="store_true",
+    help="Do not delete temporary extraction folders (debugging / inspection).",
+  )
+  ap.add_argument(
+    "--max-depth",
+    type=int,
+    default=2,
+    help="Maximum recursion depth for nested archives (default: 2)",
+  )
 
   args = ap.parse_args(argv)
 
   source = args.source.expanduser()
   if not source.exists():
     die(f"Source not found: {source}")
+
+  # Determine where to place temporary files.
+  if args.work_dir is not None:
+    work_dir = args.work_dir.expanduser()
+    if not work_dir.exists():
+      die(f"--work-dir does not exist: {work_dir}")
+    if not work_dir.is_dir():
+      die(f"--work-dir is not a directory: {work_dir}")
+  else:
+    work_dir = Path("/tmp") if Path("/tmp").is_dir() else Path(tempfile.gettempdir())
 
   if args.game_dir is not None:
     game_dir = args.game_dir.expanduser()
@@ -411,36 +768,37 @@ def main(argv: Optional[List[str]] = None) -> int:
     game_dir = choose_from_list("Where is Automobilista 2 installed?", candidates)
 
   if source.is_dir():
-    # User already extracted the archive manually.
-    overlay_roots = collect_overlay_roots(source)
-    if not overlay_roots:
+    log(f"Installing to: {game_dir}")
+    installed = install_from_extracted_dir(
+      source,
+      game_dir=game_dir,
+      dry_run=args.dry_run,
+      work_dir=work_dir,
+      keep_work=args.keep_work,
+      max_depth=max(0, args.max_depth),
+    )
+    if installed == 0:
       die(
         "Could not find an AMS2 overlay (or nested mod archives) in the provided folder. "
         "Expected an 'Automobilista 2/' folder (or at least 'UserData/' / 'Vehicles/'), "
         "or a folder containing mod archives (.zip/.7z/.rar)."
       )
-
-    log(f"Installing to: {game_dir}")
-    for overlay_root in overlay_roots:
-      log(f"Mod root: {overlay_root}")
-      install_overlay(overlay_root, game_dir, args.dry_run)
   else:
-    tmp_base = Path("/tmp") if Path("/tmp").is_dir() else None
-    with tempfile.TemporaryDirectory(prefix="ams2_pitbox_", dir=str(tmp_base) if tmp_base else None) as tmp:
-      tmpdir = Path(tmp)
-      extract_archive(source, tmpdir)
-      overlay_roots = collect_overlay_roots(tmpdir)
-      if not overlay_roots:
-        die(
-          "Could not find an AMS2 overlay after extracting the archive. "
-          "Expected an 'Automobilista 2/' folder (or at least 'UserData/' / 'Vehicles/'), "
-          "or nested mod archives (.zip/.7z/.rar)."
-        )
-
-      log(f"Installing to: {game_dir}")
-      for overlay_root in overlay_roots:
-        log(f"Mod root: {overlay_root}")
-        install_overlay(overlay_root, game_dir, args.dry_run)
+    log(f"Installing to: {game_dir}")
+    installed = install_from_archive(
+      source,
+      game_dir=game_dir,
+      dry_run=args.dry_run,
+      work_dir=work_dir,
+      keep_work=args.keep_work,
+      max_depth=max(0, args.max_depth),
+    )
+    if installed == 0:
+      die(
+        "Could not find an AMS2 overlay in the archive (or nested mod archives inside it). "
+        "Expected an 'Automobilista 2/' folder (or at least 'UserData/' / 'Vehicles/'), "
+        "or nested mod archives (.zip/.7z/.rar)."
+      )
 
   log("Done.")
   return 0

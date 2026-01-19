@@ -35,6 +35,28 @@ Some big packs ship as a single `.7z` containing many smaller mod archives next 
 If PitBox doesn’t find an `Automobilista 2/` / `Vehicles/` / `UserData/` overlay after extracting,
 it will look for nested archives (`.7z`, `.zip`, `.rar`), extract each one, and install them one by one.
 
+### 💾 Low disk space (ENOSPC / errno=28)
+
+If you see errors like:
+
+- `errno=28` / `No space left on device`
+
+…it usually means your temp folder (often `/tmp`) is too small for a big “container pack”.
+
+PitBox can process nested archives one-by-one (instead of unpacking everything at once), and you can also
+choose where temporary files are written:
+
+- `--work-dir /path/to/a/bigger/disk`
+
+Examples:
+
+- Steam Deck SD card (example path): `--work-dir /run/media/mmcblk0p1`
+- External drive mount: `--work-dir /mnt/external`
+
+If you want to inspect what PitBox extracted, add:
+
+- `--keep-work`
+
 ## 🚀 Quick start (noob mode)
 
 1) 📥 Put your archive in `~/Downloads` (example: `SomeMod.zip`)
